@@ -34,10 +34,11 @@ ENV/
 env.bak/
 venv.bak/
 
-# Datasets and raw fundus images
-data/
-datasets/
-raw_data/
+# Datasets and raw fundus images (anchored to workspace root)
+/data/
+/datasets/
+/raw_data/
+!src/oculi/data/**
 *.zip
 *.tar
 *.tar.gz

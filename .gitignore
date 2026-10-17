@@ -38,7 +38,6 @@ venv.bak/
 /data/
 /datasets/
 /raw_data/
-!src/oculi/data/**
 *.zip
 *.tar
 *.tar.gz

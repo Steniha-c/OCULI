@@ -1,0 +1,103 @@
+# ==============================================================================
+# Oculi: Diabetic Retinopathy Research Prototype - Configuration
+# ==============================================================================
+
+project:
+  name: "oculi"
+  version: "0.1.0"
+  seed: 42
+  description: "Diabetic Retinopathy Screening and Triage Prototype"
+
+# 5-Class International Clinical Diabetic Retinopathy Severity Scale
+classes:
+  num_classes: 5
+  names:
+    0: "No DR"
+    1: "Mild NPDR"
+    2: "Moderate NPDR"
+    3: "Severe NPDR"
+    4: "Proliferative DR"
+  descriptions:
+    0: "No apparent retinal vascular abnormalities (no microaneurysms)."
+    1: "Microaneurysms only."
+    2: "More than just microaneurysms, but less than severe NPDR."
+    3: "Any of: >20 intraretinal hemorrhages in 4 quadrants, venous beading in 2+ quadrants, or IRMA in 1+ quadrant (4-2-1 rule)."
+    4: "Neovascularization, vitreous hemorrhage, or preretinal hemorrhage."
+  referable_threshold: 2  # Grade >= 2 defines Referable Diabetic Retinopathy (RDR)
+
+data:
+  train_csv: "data/train.csv"
+  val_csv: "data/val.csv"
+  test_csv: "data/test.csv"
+  image_dir: "data/images"
+  image_size: 224
+  crop_fov: true
+  circular_mask: true
+  apply_ben_graham: false
+  val_split: 0.2
+
+# Fundus Image Quality Verification Parameters
+quality:
+  blur_threshold: 80.0       # Minimum Laplacian variance for adequate sharpness
+  min_mean_intensity: 30.0   # Minimum mean grayscale intensity (underexposure check)
+  max_mean_intensity: 220.0  # Maximum mean grayscale intensity (overexposure check)
+  min_fov_ratio: 0.20        # Minimum proportion of valid retinal tissue pixels
+
+# Backbone Model Architecture
+model:
+  backbone: "efficientnet_b0"
+  pretrained: true           # Load standard ImageNet-1K pretrained weights
+  num_classes: 5
+  dropout: 0.2
+  target_layer: "features.8" # Target conv layer for Grad-CAM explainability
+
+# Optimization & Hyperparameters (Ready for Google Colab / Local Execution)
+training:
+  epochs: 20
+  batch_size: 16
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  num_workers: 0             # 0 for Windows local multiprocessing stability; 2-4 in Colab
+  mixed_precision: true      # Uses torch.cuda.amp when CUDA is present
+  early_stopping_patience: 5
+  checkpoint_dir: "checkpoints"
+  checkpoint_name: "best_model.pth"
+
+# Post-Hoc Confidence Calibration
+calibration:
+  temperature: 1.0           # Temperature scaling divisor for logits
+
+# Clinical Referral and Triage Recommendation Protocol
+triage:
+  threshold_rdr: 2           # Referable Diabetic Retinopathy threshold
+  urgency_levels:
+    0:
+      action: "Routine Rescreening"
+      timeframe: "12 Months"
+      priority: "Routine"
+      badge: "normal"
+      recommendation: "Regular annual diabetic retinal examination recommended. Maintain optimal glycemic control."
+    1:
+      action: "Clinical Surveillance"
+      timeframe: "6 - 12 Months"
+      priority: "Low"
+      badge: "mild"
+      recommendation: "Early retinal vascular changes detected. Repeat retinal screening in 6 to 12 months with primary care review."
+    2:
+      action: "Ophthalmic Referral"
+      timeframe: "2 - 3 Months"
+      priority: "Moderate (Referable DR)"
+      badge: "referable"
+      recommendation: "Referable diabetic retinopathy detected. Schedule comprehensive dilated examination by an ophthalmologist."
+    3:
+      action: "High-Priority Ophthalmic Referral"
+      timeframe: "2 - 4 Weeks"
+      priority: "High (Referable DR)"
+      badge: "high"
+      recommendation: "Severe non-proliferative changes detected. Prompt ophthalmic evaluation required to prevent vision-threatening progression."
+    4:
+      action: "Urgent Ophthalmic Referral"
+      timeframe: "Within 1 Week"
+      priority: "Urgent (Sight-Threatening DR)"
+      badge: "urgent"
+      recommendation: "Critical signs of proliferative retinopathy detected. Immediate specialist consultation required."

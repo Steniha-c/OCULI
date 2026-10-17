@@ -176,18 +176,29 @@ def run_training(args: argparse.Namespace) -> None:
     is_dry_run = args.dry_run
     dummy_samples = args.synthetic_samples if is_dry_run else 0
 
-    if not is_dry_run and not (train_csv and Path(train_csv).exists()):
-        logger.warning(
-            f"Training CSV not found at '{train_csv}'. "
-            "Switching automatically to dry-run mode with synthetic fundus data. "
-            "To train on real clinical data, provide --train-csv and --image-dir."
-        )
-        is_dry_run = True
-        dummy_samples = 20
-
-    if is_dry_run:
+    if not is_dry_run:
+        # Validate that real dataset inputs exist and are specified
+        if not train_csv or not Path(train_csv).exists():
+            raise FileNotFoundError(
+                f"Training CSV not found at '{train_csv}'. "
+                f"For real-data training, specify an existing CSV path via --train-csv or in config. "
+                f"To run a software verification test with synthetic data, explicitly pass --dry-run."
+            )
+        if not val_csv or not Path(val_csv).exists():
+            raise FileNotFoundError(
+                f"Validation CSV not found at '{val_csv}'. "
+                f"For real-data training, specify an existing validation CSV path via --val-csv or in config. "
+                f"To run a software verification test with synthetic data, explicitly pass --dry-run."
+            )
+        if not image_dir or not Path(image_dir).is_dir():
+            raise FileNotFoundError(
+                f"Image directory not found at '{image_dir}'. "
+                f"For real-data training, provide a valid directory containing retinal images via --image-dir or in config. "
+                f"To run a software verification test with synthetic data, explicitly pass --dry-run."
+            )
+    else:
         epochs = min(epochs, 2)
-        logger.info(f"Executing DRY-RUN verification: {dummy_samples} synthetic samples, {epochs} epochs.")
+        logger.info(f"Executing explicit DRY-RUN verification: {dummy_samples} synthetic samples, {epochs} epochs.")
 
     train_loader, val_loader = create_dataloaders(
         train_csv=train_csv if not is_dry_run else None,
@@ -198,6 +209,11 @@ def run_training(args: argparse.Namespace) -> None:
         num_workers=num_workers,
         dummy_samples=dummy_samples,
     )
+
+    if len(train_loader.dataset) == 0:
+        raise ValueError("Training dataset contains 0 samples. Cannot start training.")
+    if len(val_loader.dataset) == 0:
+        raise ValueError("Validation dataset contains 0 samples. Cannot evaluate model during training.")
 
     logger.info(f"Loaded {len(train_loader.dataset)} training samples and {len(val_loader.dataset)} validation samples.")
 

@@ -205,9 +205,9 @@ class RetinopathyDataset(Dataset):
     Supports:
     - CSV annotations with flexible column mappings (e.g. `image_id`, `id_code`, `image` / `diagnosis`, `level`).
     - Direct directory image loading.
-    - Optional automated circular FOV cropping.
-    - Quality checking / filtering out unusable images.
-    - Synthetic fallback mode for prototyping and automated tests.
+    - Strict validation of dataset inputs, labels, and file existence.
+    - Explicit synthetic mode for software testing and dry runs only.
+    - Raises clear errors on missing, unreadable, or corrupt files (no silent fallback).
     """
 
     def __init__(
@@ -220,6 +220,7 @@ class RetinopathyDataset(Dataset):
         quality_filter: bool = False,
         synthetic_samples: int = 0,
         image_size: int = 224,
+        check_images_exist: bool = True,
     ) -> None:
         self.image_dir = Path(image_dir) if image_dir else None
         self.transform = transform if transform else get_transforms(image_size, is_train=False)
@@ -228,11 +229,12 @@ class RetinopathyDataset(Dataset):
         self.quality_filter = quality_filter
         self.image_size = image_size
         self.synthetic_samples = synthetic_samples
+        self.check_images_exist = check_images_exist
 
         self.samples: List[Dict[str, Any]] = []
 
         if synthetic_samples > 0:
-            # Generate dummy sample registry
+            # Generate synthetic sample registry exclusively when explicitly requested
             for i in range(synthetic_samples):
                 dummy_grade = i % 5
                 self.samples.append({
@@ -241,60 +243,142 @@ class RetinopathyDataset(Dataset):
                     "label": dummy_grade,
                     "is_synthetic": True,
                 })
-        elif df_or_csv is not None:
+        else:
+            if df_or_csv is None:
+                raise ValueError(
+                    "Missing dataset input: 'df_or_csv' must be provided when synthetic_samples=0."
+                )
+
             if isinstance(df_or_csv, (str, Path)):
-                if os.path.exists(str(df_or_csv)):
-                    df = pd.read_csv(str(df_or_csv))
-                else:
-                    logger.warning(f"CSV file not found: {df_or_csv}. Initializing empty dataset.")
-                    df = pd.DataFrame()
-            else:
+                csv_path = Path(df_or_csv)
+                if not csv_path.exists():
+                    raise FileNotFoundError(f"Annotation CSV file not found: '{csv_path}'.")
+                df = pd.read_csv(csv_path)
+            elif isinstance(df_or_csv, pd.DataFrame):
                 df = df_or_csv.copy()
+            else:
+                raise TypeError(
+                    f"Unsupported df_or_csv type: {type(df_or_csv)}. Expected Path, str, or DataFrame."
+                )
 
             self._parse_dataframe(df)
 
     def _parse_dataframe(self, df: pd.DataFrame) -> None:
-        """Parse DataFrame with flexible column naming conventions."""
+        """Parse and strictly validate annotations DataFrame."""
         if df.empty:
-            return
+            raise ValueError("Dataset is empty. The provided CSV / DataFrame contains no rows.")
 
+        id_candidates = ["id_code", "image_id", "image", "filename", "id"]
         id_col = None
-        for candidate in ["id_code", "image_id", "image", "filename", "id"]:
+        for candidate in id_candidates:
             if candidate in df.columns:
                 id_col = candidate
                 break
 
+        label_candidates = ["diagnosis", "level", "label", "grade", "target", "dr_grade"]
         label_col = None
-        for candidate in ["diagnosis", "level", "label", "grade", "target", "dr_grade"]:
+        for candidate in label_candidates:
             if candidate in df.columns:
                 label_col = candidate
                 break
 
         if id_col is None or label_col is None:
-            logger.warning(
-                f"Could not automatically detect image ID or label columns in {df.columns.tolist()}."
+            raise ValueError(
+                f"Dataset missing required columns. Could not detect image-ID column "
+                f"(supported: {id_candidates}) or label column (supported: {label_candidates}) "
+                f"in DataFrame columns: {df.columns.tolist()}."
             )
-            return
 
-        for _, row in df.iterrows():
-            img_id = str(row[id_col])
-            label = int(row[label_col])
+        # Check for missing/null/blank image IDs
+        if df[id_col].isna().any():
+            null_id_indices = df[df[id_col].isna()].index.tolist()
+            raise ValueError(
+                f"Dataset contains null or missing image IDs at row index(es): {null_id_indices[:5]}."
+            )
+
+        blank_id_mask = df[id_col].astype(str).str.strip() == ""
+        if blank_id_mask.any():
+            blank_indices = df[blank_id_mask].index.tolist()
+            raise ValueError(
+                f"Dataset contains blank/empty image IDs at row index(es): {blank_indices[:5]}."
+            )
+
+        # Check for missing/null labels
+        if df[label_col].isna().any():
+            null_label_indices = df[df[label_col].isna()].index.tolist()
+            raise ValueError(
+                f"Dataset contains null or missing labels at row index(es): {null_label_indices[:5]}."
+            )
+
+        # Validate label values: must be integers in range [0, 4]
+        for row_idx, raw_val in df[label_col].items():
+            if isinstance(raw_val, (bool, np.bool_)):
+                raise ValueError(
+                    f"Invalid boolean label '{raw_val}' found at row {row_idx} in column '{label_col}'. "
+                    "Labels must be integer DR severity grades in range 0–4."
+                )
+            try:
+                val_float = float(raw_val)
+                if not val_float.is_integer():
+                    raise ValueError
+                int_label = int(val_float)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid non-integer label '{raw_val}' found at row {row_idx} in column '{label_col}'. "
+                    "Labels must be integer DR severity grades in range 0–4."
+                )
+
+            if int_label < 0 or int_label > 4:
+                raise ValueError(
+                    f"Label value {int_label} at row {row_idx} in column '{label_col}' is outside the "
+                    "supported range 0–4 (0: No DR, 1: Mild, 2: Moderate, 3: Severe, 4: Proliferative DR)."
+                )
+
+        # Check image directory if specified
+        if self.image_dir is not None:
+            if not self.image_dir.exists() or not self.image_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Image directory not found or is not a directory: '{self.image_dir}'."
+                )
+
+        # Verify that all referenced images exist
+        missing_images = []
+        supported_extensions = ["", ".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"]
+
+        for row_idx, row in df.iterrows():
+            img_id = str(row[id_col]).strip()
+            int_label = int(float(row[label_col]))
 
             # Locate file path
             img_path = None
             if self.image_dir:
-                for ext in ["", ".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"]:
+                for ext in supported_extensions:
                     candidate = self.image_dir / f"{img_id}{ext}"
-                    if candidate.exists():
+                    if candidate.exists() and candidate.is_file():
                         img_path = candidate
                         break
+            else:
+                p = Path(img_id)
+                if p.exists() and p.is_file():
+                    img_path = p
 
-            self.samples.append({
-                "id": img_id,
-                "path": str(img_path) if img_path else None,
-                "label": label,
-                "is_synthetic": False,
-            })
+            if self.check_images_exist and img_path is None:
+                missing_images.append(img_id)
+            else:
+                self.samples.append({
+                    "id": img_id,
+                    "path": str(img_path) if img_path else None,
+                    "label": int_label,
+                    "is_synthetic": False,
+                })
+
+        if self.check_images_exist and missing_images:
+            search_loc = f"directory '{self.image_dir}'" if self.image_dir else "specified paths"
+            raise FileNotFoundError(
+                f"Referenced image file(s) not found in {search_loc}. "
+                f"Missing {len(missing_images)} of {len(df)} images. "
+                f"First missing image IDs: {missing_images[:10]}"
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -304,20 +388,27 @@ class RetinopathyDataset(Dataset):
         label = item["label"]
         img_id = item["id"]
 
-        if item.get("is_synthetic") or item["path"] is None:
-            # Generate synthetic fundus on-the-fly
+        if item.get("is_synthetic"):
+            # Synthetic image generated only when explicitly requested (dry-run/testing)
             img_rgb = create_synthetic_fundus_image(
                 size=self.image_size, grade=label, seed=idx
             )
         else:
-            bgr = cv2.imread(item["path"])
-            if bgr is None:
-                # Corrupt image fallback
-                img_rgb = create_synthetic_fundus_image(
-                    size=self.image_size, grade=label, seed=idx
+            img_path = item.get("path")
+            if img_path is None or not os.path.exists(img_path):
+                raise FileNotFoundError(
+                    f"Image file not found for sample ID '{img_id}' at path: '{img_path}'. "
+                    "Synthetic image fallback is disabled in real-data mode."
                 )
-            else:
-                img_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            bgr = cv2.imread(img_path)
+            if bgr is None:
+                raise ValueError(
+                    f"Failed to read or decode fundus image for sample ID '{img_id}' at path: '{img_path}'. "
+                    "The file may be corrupt, empty, or an unsupported image format. "
+                    "Synthetic image fallback is disabled in real-data mode."
+                )
+            img_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         # Optional FOV cropping & circular masking
         if self.crop_fov:

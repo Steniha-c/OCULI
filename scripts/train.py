@@ -159,7 +159,8 @@ def run_training(args: argparse.Namespace) -> None:
     lr = args.lr if args.lr else train_cfg.get("learning_rate", 3e-4)
     weight_decay = train_cfg.get("weight_decay", 1e-4)
     image_size = data_cfg.get("image_size", 224)
-    checkpoint_dir = Path(train_cfg.get("checkpoint_dir", "checkpoints"))
+    raw_ckpt_dir = getattr(args, "checkpoint_dir", None) or train_cfg.get("checkpoint_dir", "checkpoints")
+    checkpoint_dir = Path(raw_ckpt_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_checkpoint_path = checkpoint_dir / train_cfg.get("checkpoint_name", "best_model.pth")
 
@@ -298,6 +299,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-csv", type=str, default=None, help="Path to training CSV")
     parser.add_argument("--val-csv", type=str, default=None, help="Path to validation CSV")
     parser.add_argument("--image-dir", type=str, default=None, help="Path to retinal images folder")
+    parser.add_argument("--checkpoint-dir", type=str, default=None, help="Directory to save checkpoints")
     parser.add_argument("--dry-run", action="store_true", help="Run short verification with synthetic samples")
     parser.add_argument("--synthetic-samples", type=int, default=16, help="Sample count for dry-run")
     return parser.parse_args()

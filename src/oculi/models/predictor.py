@@ -26,7 +26,11 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 from oculi.models.backbone import OculiEfficientNetB0, build_model
-from oculi.preprocessing.quality import to_numpy_rgb
+from oculi.preprocessing.quality import (
+    apply_circular_mask,
+    detect_and_crop_fov,
+    to_numpy_rgb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +81,7 @@ class PredictionResult:
     triage: TriageDecision
     cam_heatmap: Optional[np.ndarray] = None
     cam_overlay: Optional[np.ndarray] = None
+    preprocessed_image: Optional[np.ndarray] = None
     model_source: str = "ImageNet-Pretrained Prototype (Uncalibrated)"
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -137,29 +142,37 @@ class GradCAM:
 
     def generate_heatmap(
         self,
-        input_tensor: torch.Tensor,
+        input_tensor: Optional[torch.Tensor] = None,
         target_class: Optional[int] = None,
         image_size: Tuple[int, int] = (224, 224),
+        logits: Optional[torch.Tensor] = None,
     ) -> np.ndarray:
         """
         Generate 2D normalized Grad-CAM heatmap for a target class.
 
         Args:
-            input_tensor: Tensor of shape (1, 3, H, W).
+            input_tensor: Tensor of shape (1, 3, H, W). Required if logits is None.
             target_class: Class index to explain. If None, uses top predicted class.
             image_size: Output spatial resolution (width, height).
+            logits: Optional precomputed unnormalized logits from the forward pass.
+                When provided, skips the redundant model forward pass.
 
         Returns:
             np.ndarray: 2D float array in range [0, 1].
         """
-        self.model.eval()
-        self.model.zero_grad()
-
-        logits = self.model(input_tensor)
+        if logits is None:
+            if input_tensor is None:
+                raise ValueError(
+                    "Either 'input_tensor' or precomputed 'logits' must be provided to generate_heatmap."
+                )
+            self.model.eval()
+            self.model.zero_grad()
+            logits = self.model(input_tensor)
 
         if target_class is None:
             target_class = int(torch.argmax(logits, dim=-1).item())
 
+        self.model.zero_grad()
         score = logits[0, target_class]
         score.backward(retain_graph=True)
 
@@ -317,6 +330,8 @@ class DRPredictor:
         image_size: int = 224,
         temperature: float = 1.0,
         device: Optional[Union[str, torch.device]] = None,
+        crop_fov: bool = True,
+        circular_mask: bool = True,
     ) -> None:
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -324,6 +339,8 @@ class DRPredictor:
             self.device = torch.device(device)
 
         self.image_size = image_size
+        self.crop_fov = crop_fov
+        self.circular_mask = circular_mask
         self.scaler = TemperatureScaler(temperature=temperature)
         self.triage_engine = TriageEngine(referable_threshold=2)
 
@@ -363,11 +380,87 @@ class DRPredictor:
             ),
         ])
 
+    def set_temperature(self, temperature: float) -> None:
+        """
+        Update confidence calibration temperature without re-instantiating the model or reloading weights.
+
+        Args:
+            temperature: Divisor for logits (>0). T > 1 softens probabilities; T < 1 sharpens them.
+        """
+        self.scaler = TemperatureScaler(temperature=temperature)
+
+    def preprocess_image(
+        self,
+        image_input: Union[str, Path, Image.Image, np.ndarray],
+        crop_fov: Optional[bool] = None,
+        circular_mask: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, np.ndarray]:
+        """
+        Preprocess an input fundus image using the exact pipeline from training:
+        1. Standardize input to uint8 RGB NumPy array.
+        2. Detect and crop the circular retinal Field-of-View (FOV).
+        3. Apply circular aperture mask to zero out corner artifacts.
+        4. Validate that the resulting crop is non-empty and contains valid retinal tissue.
+        5. Apply standard ImageNet resizing and normalization to PyTorch tensor.
+
+        Args:
+            image_input: Retinal image (path, PIL Image, or RGB NumPy array).
+            crop_fov: Optional override for FOV cropping (defaults to self.crop_fov).
+            circular_mask: Optional override for circular aperture masking (defaults to self.circular_mask).
+
+        Returns:
+            Tuple[torch.Tensor, np.ndarray]:
+                - Normalized tensor of shape (1, 3, H, W) on the target device.
+                - Intermediate preprocessed RGB NumPy array (cropped and masked).
+        """
+        apply_crop = self.crop_fov if crop_fov is None else crop_fov
+        apply_mask = self.circular_mask if circular_mask is None else circular_mask
+
+        image_rgb = to_numpy_rgb(image_input)
+        if image_rgb.size == 0 or image_rgb.shape[0] < 10 or image_rgb.shape[1] < 10:
+            raise ValueError(
+                f"Input fundus image is empty or invalid: shape {image_rgb.shape}."
+            )
+
+        # 1. Retinal Field-of-View (FOV) Cropping
+        if apply_crop:
+            cropped_rgb, bbox = detect_and_crop_fov(image_rgb)
+            if (
+                cropped_rgb.size == 0
+                or cropped_rgb.shape[0] < 10
+                or cropped_rgb.shape[1] < 10
+            ):
+                raise ValueError(
+                    f"Invalid or empty crop detected: retinal FOV segmentation resulted in invalid dimensions "
+                    f"{cropped_rgb.shape[:2]}."
+                )
+
+            # Quality check: ensure image contains illuminated retinal tissue
+            gray = cv2.cvtColor(cropped_rgb, cv2.COLOR_RGB2GRAY)
+            if not np.any(gray > 15):
+                raise ValueError(
+                    "Invalid retinal Field-of-View: image contains no illuminated retinal tissue "
+                    "(entirely dark or empty image)."
+                )
+
+            image_rgb = cropped_rgb
+
+        # 2. Circular Aperture Masking
+        if apply_mask:
+            image_rgb = apply_circular_mask(image_rgb)
+
+        # 3. Standard PyTorch ImageNet Transformation
+        tensor = self.transform(image_rgb).unsqueeze(0).to(self.device)
+        return tensor, image_rgb
+
     def predict(
         self,
         image_input: Union[str, Path, Image.Image, np.ndarray],
         generate_cam: bool = True,
         target_class: Optional[int] = None,
+        crop_fov: Optional[bool] = None,
+        circular_mask: Optional[bool] = None,
+        temperature: Optional[float] = None,
     ) -> PredictionResult:
         """
         Execute full screening pipeline on an input fundus image.
@@ -376,28 +469,39 @@ class DRPredictor:
             image_input: Retinal image (path, PIL Image, or RGB NumPy array).
             generate_cam: If True, computes Grad-CAM explainability heatmap.
             target_class: Specific class to explain with Grad-CAM (None = top class).
+            crop_fov: Optional override for FOV cropping.
+            circular_mask: Optional override for circular aperture masking.
+            temperature: Optional override for confidence calibration temperature.
 
         Returns:
             PredictionResult: Rich inference outcome with triage and CAM overlay.
         """
-        image_rgb = to_numpy_rgb(image_input)
-        h_orig, w_orig = image_rgb.shape[:2]
+        raw_rgb = to_numpy_rgb(image_input)
+        h_orig, w_orig = raw_rgb.shape[:2]
 
-        # Apply preprocessing transforms
-        tensor = self.transform(image_rgb).unsqueeze(0).to(self.device)
+        # Apply preprocessing matching training (FOV crop + circular mask)
+        tensor, preprocessed_rgb = self.preprocess_image(
+            image_input=raw_rgb,
+            crop_fov=crop_fov,
+            circular_mask=circular_mask,
+        )
+        h_prep, w_prep = preprocessed_rgb.shape[:2]
 
-        # Grad-CAM setup if requested
+        # Grad-CAM setup if requested (register hook before forward pass)
         grad_cam: Optional[GradCAM] = None
         if generate_cam:
             grad_cam = GradCAM(self.model, self.model.target_cam_layer)
 
-        # Model inference
+        # Single model inference pass (with gradients enabled if Grad-CAM requested)
         with torch.set_grad_enabled(generate_cam):
             logits = self.model(tensor)
 
-        # Calculate calibrated probabilities
+        # Calculate calibrated probabilities using active scaler
+        effective_scaler = (
+            self.scaler if temperature is None else TemperatureScaler(temperature=temperature)
+        )
         with torch.no_grad():
-            probs_tensor = self.scaler.compute_probabilities(logits).squeeze(0)
+            probs_tensor = effective_scaler.compute_probabilities(logits).squeeze(0)
             probs = probs_tensor.cpu().numpy()
 
         pred_grade = int(np.argmax(probs))
@@ -407,7 +511,7 @@ class DRPredictor:
             DR_CLASSES[i]: float(probs[i]) for i in range(len(DR_CLASSES))
         }
 
-        # Generate CAM
+        # Generate CAM using precomputed logits (eliminating redundant forward pass)
         cam_heatmap: Optional[np.ndarray] = None
         cam_overlay: Optional[np.ndarray] = None
 
@@ -416,13 +520,17 @@ class DRPredictor:
             cam_heatmap = grad_cam.generate_heatmap(
                 input_tensor=tensor,
                 target_class=cam_class,
-                image_size=(w_orig, h_orig),
+                image_size=(w_prep, h_prep),
+                logits=logits,
             )
-            cam_overlay = grad_cam.overlay_heatmap(image_rgb, cam_heatmap)
+            cam_overlay = grad_cam.overlay_heatmap(preprocessed_rgb, cam_heatmap)
             grad_cam.close()
 
         # Clinical Triage Recommendation
         triage = self.triage_engine.evaluate(grade=pred_grade, confidence=confidence)
+
+        effective_crop = self.crop_fov if crop_fov is None else crop_fov
+        effective_mask = self.circular_mask if circular_mask is None else circular_mask
 
         return PredictionResult(
             predicted_grade=pred_grade,
@@ -434,11 +542,15 @@ class DRPredictor:
             triage=triage,
             cam_heatmap=cam_heatmap,
             cam_overlay=cam_overlay,
+            preprocessed_image=preprocessed_rgb,
             model_source=self.model_source,
             metadata={
                 "input_resolution": (w_orig, h_orig),
+                "preprocessed_resolution": (w_prep, h_prep),
                 "model_input_size": (self.image_size, self.image_size),
-                "temperature": self.scaler.temperature,
+                "crop_fov": effective_crop,
+                "circular_mask": effective_mask,
+                "temperature": effective_scaler.temperature,
                 "device": str(self.device),
             },
         )

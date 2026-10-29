@@ -199,10 +199,14 @@ class TestAccidentalDryRunPrevention:
         with pytest.raises(FileNotFoundError, match="Training CSV not found"):
             run_training(args)
 
-    def test_train_explicit_dry_run_executes(self) -> None:
+    def test_train_explicit_dry_run_executes(self, tmp_path: Path) -> None:
         """Verify that explicit --dry-run still executes as intended for software verification."""
+        tmp_ckpt_dir = tmp_path / "checkpoints"
+        tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
         args = argparse.Namespace(
             config="configs/default.yaml",
+            checkpoint_dir=str(tmp_ckpt_dir),
             epochs=1,
             batch_size=2,
             lr=1e-4,
@@ -216,3 +220,8 @@ class TestAccidentalDryRunPrevention:
 
         # Should complete without error
         run_training(args)
+
+        # Verify that checkpoint output was written to tmp_path and NOT production folder
+        assert (tmp_ckpt_dir / "best_model.pth").exists(), (
+            "Dry-run checkpoint was expected in tmp_path, but not found."
+        )

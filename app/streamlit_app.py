@@ -144,11 +144,10 @@ st.markdown(
 
 
 @st.cache_resource
-def get_predictor(checkpoint_path: Optional[str], temperature: float) -> DRPredictor:
-    """Instantiate and cache the deep learning screening predictor."""
+def get_predictor(checkpoint_path: Optional[str]) -> DRPredictor:
+    """Instantiate and cache the deep learning screening predictor by checkpoint path."""
     return DRPredictor(
         checkpoint_path=checkpoint_path,
-        temperature=temperature,
     )
 
 
@@ -235,8 +234,9 @@ def main() -> None:
         st.info("👈 Please select a demo fundus case or upload a fundus photograph from the sidebar to begin.")
         return
 
-    # Load predictor
-    predictor = get_predictor(chk_path, temperature)
+    # Load predictor (cached by checkpoint path; temperature scales dynamically without model reload)
+    predictor = get_predictor(chk_path)
+    predictor.set_temperature(temperature)
 
     # 1. Image Quality Assessment
     quality_report = assess_fundus_quality(
@@ -276,8 +276,12 @@ def main() -> None:
         st.markdown("---")
 
         # Run Prediction & Grad-CAM
-        with st.spinner("Analyzing retinal morphology and generating Grad-CAM heatmaps..."):
-            pred_result = predictor.predict(image_to_analyze, generate_cam=True)
+        try:
+            with st.spinner("Analyzing retinal morphology and generating Grad-CAM heatmaps..."):
+                pred_result = predictor.predict(image_to_analyze, generate_cam=True)
+        except ValueError as err:
+            st.error(f"⚠️ Screening Aborted: {err}")
+            return
 
         col_img_orig, col_img_cam = st.columns(2)
         with col_img_orig:
